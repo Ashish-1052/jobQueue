@@ -95,11 +95,6 @@ export class Queue {
     // 4. heartbeat on the jobs that are currently being worked upon
     // 5. reaper that cleans (a separate timer I suppose)
     
-    
-    const jobsClaims = this.claim; // steps 1, 2, 3
-    this.pollWithTimeOut(jobsClaims, this.pollIntervalMs, 'JOBS');
-    const reap = this.reap; // 5
-    this.pollWithTimeOut(reap, this.reapIntervalMs, 'REAP');
     this.cancelers.push(this.pollWithTimeOut(this.claim, this.pollIntervalMs, 'CLAIM'));
     this.cancelers.push(this.pollWithTimeOut(this.reap, this.reapIntervalMs, 'REAP'));
   }
@@ -107,7 +102,7 @@ export class Queue {
   claim = async () => {
     try {    
       const freeSlots = this._concurrency - this.runningCount;
-      if (!freeSlots) return { claimed: 0 };
+      if (!freeSlots) return this.pollIntervalMs;
       const res = await this.db.query(CLAIM, [this.workerId, freeSlots]);
       const jobPromises: Promise<any>[] = [];
       let processed = 0;
@@ -139,10 +134,10 @@ export class Queue {
         jobPromises.push(jobPromise);
       }
       void Promise.all(jobPromises); // dont await here, pool cant claim until every job finishes
-      return { claimed: res.rows.length, processed, failed };
+      return res.rows.length === freeSlots ? 0 : this.pollIntervalMs;
     } catch (e: any) {
       this.logger.error(e?.message)
-      return { claimed: 0, processed: 0, failed: 0 };
+      return 0;
     }
   }
 
@@ -151,7 +146,7 @@ export class Queue {
       await this.db.query(ACK, [jobId, this.workerId]);
       this.logger.info(`Job acknowledged successfully for id: ${jobId}`);
     } catch (e) {
-      this.logger.info(`Unable to acknowledge job for id: ${jobId}`);
+      this.logger.error(`Unable to acknowledge job for id: ${jobId}`);
     }
   }
 
@@ -160,7 +155,7 @@ export class Queue {
       await this.db.query(FAIL, [jobId, this.workerId, e instanceof Error ? e.message : String(e)]);
       this.logger.info(`Job failed successfully for id: ${jobId}`);
     } catch (e) {
-      this.logger.info(`Unable to fail job for id: ${jobId}`);
+      this.logger.error(`Unable to fail job for id: ${jobId}`);
     }
   }
 
