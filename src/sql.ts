@@ -6,7 +6,7 @@ export const ENQUEUE = `
   `
 
 export const ENQUEUE_FALLBACK = `
-  SELECT * FROM  jobs.jobs where function_id = $1 AND idempotency_key = $2;
+  SELECT * FROM jobs.jobs where function_id = $1 AND idempotency_key = $2;
 `
 
 export const CLAIM = `
@@ -60,7 +60,7 @@ export const FAIL = `
   RETURNING id, status;
   `
 
-export const TICK = `
+export const HEARTBEAT = `
   UPDATE jobs.jobs
   SET locked_until = now() + INTERVAL '30 seconds',
       updated_at   = now()

@@ -1,12 +1,20 @@
+import type { PoolConfig } from "pg";
 import { ConnectionPool, createPool } from "./db.ts";
-import { ACK, CLAIM, ENQUEUE, ENQUEUE_FALLBACK, FAIL, REAP, TICK } from "./sql.js";
+import { ACK, CLAIM, ENQUEUE, ENQUEUE_FALLBACK, FAIL, HEARTBEAT, REAP } from "./sql.ts";
 
-type Handler = (...args: any[]) => Promise<any> | any;
+type Handler = (params: any) => Promise<void> | any;
 
 interface QueueParams {
-  config: any;
+  config: PoolConfig;
   concurrency?: number;
   registry?: Map<string, Handler>;
+  logger?: Logger;
+}
+
+interface Logger {
+  info(msg: string, meta?: object): void;
+  warn(msg: string, meta?: object): void;
+  error(msg: string, meta?: object): void;
 }
 
 export class Queue {
@@ -16,15 +24,18 @@ export class Queue {
   private _concurrency: number;
   private isRunning: boolean = false;
   private pollIntervalMs: number = 1000;
-  private tickIntervalMs: number = 15000;
-  private reapIntervalMs: number = 5 * 60 * 1000;
+  private heartbeatIntervalMs: number = 15000;
+  private reapIntervalMs: number = 20000;
   private runningCount: number = 0;
+  private cancelers: Array<() => void> = []
+  private logger: Logger;
 
   constructor(params: QueueParams) {
     this.db = createPool(params.config);
     this.workerId = crypto.randomUUID();
     this.registry = new Map(params?.registry);
     this._concurrency = params?.concurrency ?? 10;
+    this.logger = params.logger ?? { info() {}, warn() {}, error: console.error };
   }
 
   enqueue = async (
@@ -39,7 +50,7 @@ export class Queue {
       const values = [
         functionId, 
         JSON.stringify(functionParams), 
-        pickupAt ? pickupAt.toISOString() : new Date().toISOString(), 
+        pickupAt ? pickupAt.toISOString() : null, 
         idempotencyKey ?? null, 
         maxAttempts ?? 3
       ];
@@ -49,9 +60,9 @@ export class Queue {
         return { job: res.rows[0], created: true };
       }
       const existing = await this.db.query(ENQUEUE_FALLBACK, [functionId, idempotencyKey]);
-      return { job: existing, created: false };
-    } catch (e) {
-      console.error("Error to enqueue", e);
+      return { job: existing.rows[0], created: false };
+    } catch (e: any) {
+      this.logger.error(e?.message);
       throw e;
     }
   }
@@ -75,7 +86,7 @@ export class Queue {
   start = async () => {
     if (this.isRunning) return;
     this.isRunning = true;
-    console.log(`Queue worker ${this.workerId} started with concurrency ${this._concurrency}.`);
+    this.logger.info(`Queue worker ${this.workerId} started with concurrency ${this._concurrency}.`);
 
     // TODO: Implement job polling from database
     // 1. start claiming by checking the free slots
@@ -87,10 +98,10 @@ export class Queue {
     
     const jobsClaims = this.claim; // steps 1, 2, 3
     this.pollWithTimeOut(jobsClaims, this.pollIntervalMs, 'JOBS');
-    const tick = this.tick; // 4
-    this.pollWithTimeOut(tick, this.tickIntervalMs, 'TICK');
     const reap = this.reap; // 5
     this.pollWithTimeOut(reap, this.reapIntervalMs, 'REAP');
+    this.cancelers.push(this.pollWithTimeOut(this.claim, this.pollIntervalMs, 'CLAIM'));
+    this.cancelers.push(this.pollWithTimeOut(this.reap, this.reapIntervalMs, 'REAP'));
   }
 
   claim = async () => {
@@ -103,11 +114,15 @@ export class Queue {
       let failed = 0;
       
       for (let job of res.rows) {
-        const handler = this.registry.get(job.functionId);
-        if (!handler) continue;
+        const handler = this.registry.get(job.function_id);
+        if (!handler) {
+          this.fail(job.id, new Error('no handler for ' + job.function_id))
+          continue;
+        }
         this.runningCount += 1;
+        const stopHeartbeat = this.startHeartbeat(job.id);
         const jobPromise = Promise.resolve()
-          .then(() => handler(JSON.parse(job.function_params)))
+          .then(() => handler(job.function_params))
           .then(async () => {
             await this.ack(job.id);
             processed++;
@@ -118,58 +133,71 @@ export class Queue {
           })
           .finally(() => {
             this.runningCount -= 1;
-            console.log(`Finished processing job ${job.id}`);
+            this.logger.info(`Finished processing job ${job.id}`);
+            stopHeartbeat();
           });
         jobPromises.push(jobPromise);
       }
-      await Promise.all(jobPromises);
+      void Promise.all(jobPromises); // dont await here, pool cant claim until every job finishes
       return { claimed: res.rows.length, processed, failed };
-    } catch (e) {
-      console.error("Error claiming jobs", e)
+    } catch (e: any) {
+      this.logger.error(e?.message)
       return { claimed: 0, processed: 0, failed: 0 };
     }
   }
 
   ack = async (jobId: string) => {
     try {
-      this.db.query(ACK, [jobId, this.workerId]);
-      console.log(`Job acknowledged successfully for id: ${jobId}`);
+      await this.db.query(ACK, [jobId, this.workerId]);
+      this.logger.info(`Job acknowledged successfully for id: ${jobId}`);
     } catch (e) {
-      console.log(`Unable to acknowledge job for id: ${jobId}`);
+      this.logger.info(`Unable to acknowledge job for id: ${jobId}`);
     }
   }
 
-  fail = async (jobId: string, e: Error) => {
+  fail = async (jobId: string, e: any) => {
     try {
-      this.db.query(FAIL, [jobId, this.workerId, e.message]);
-      console.log(`Job failed successfully for id: ${jobId}`);
+      await this.db.query(FAIL, [jobId, this.workerId, e instanceof Error ? e.message : String(e)]);
+      this.logger.info(`Job failed successfully for id: ${jobId}`);
     } catch (e) {
-      console.log(`Unable to fail job for id: ${jobId}`);
+      this.logger.info(`Unable to fail job for id: ${jobId}`);
     }
   }
 
-  tick = async () => {
-    try {
-      await this.db.query(TICK);
-    } catch (e) {
-      console.log("unable to tick", e);
-    }
+  startHeartbeat = (jobId: string) => {
+    let inFlight = false;
+    const timer = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const res = await this.db.query(HEARTBEAT, [jobId, this.workerId]);
+        if (res.rows.length === 0) {
+          console.warn(`lease lost for job ${jobId}`);
+          clearInterval(timer);
+        }
+      } catch (e: any) {
+        this.logger.error(e?.message);
+      }
+    }, this.heartbeatIntervalMs); // about a third of the lease: 10s for a 30s lease
+    return () => clearInterval(timer);
   }
 
   reap = async () => {
     try {
       const res = await this.db.query(REAP);
       return res.rows.length;
-    } catch (e) {
+    } catch (e: any) {
+      this.logger.error(e?.message);
       return 0;
-      console.log("Unable to reap", e);
     }
   }
   
   stop = async () => {
     this.isRunning = false;
     await this.db.close();
-    console.log(`Queue worker ${this.workerId} stopped.`);
+    this.cancelers.forEach(c => c());
+    this.cancelers = [];
+    this.logger.info(`Queue worker ${this.workerId} stopped.`);
   }
 
   pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string) => {
@@ -177,13 +205,15 @@ export class Queue {
       let isCancelled = false;
     
       const execute = async () => {
+        let delay = interval;
         try {
-          await task();
+          const next = await task();
+          if (typeof next === 'number') delay = next;
         } catch (e) {
-          console.error(`Error polling task type: ${taskType}`, e);
+          this.logger.error(`Error polling task type: ${taskType}`);
         } finally {
           if (!isCancelled) {
-            timerId = setTimeout(execute, interval);
+            timerId = setTimeout(execute, delay);
           }
         }
       };

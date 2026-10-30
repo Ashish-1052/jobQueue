@@ -20,3 +20,11 @@ CREATE TABLE jobs.jobs IF NOT EXISTS (
 
     CONSTRAINT "unique_function_idempotency" UNIQUE ("function_id", "idempotency_key")
 );
+
+/*
+indexes where I think should be applied
+1. function_id, idempotency_key
+2. status, pickup_at
+3. locked_by, status
+4. status, locked_until, 
+*/
