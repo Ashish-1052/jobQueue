@@ -1,4 +1,4 @@
-import pg from "pg";
+import{ Pool, type PoolConfig } from "pg";
 
 export interface DBConfig {
   host: string;
@@ -9,16 +9,30 @@ export interface DBConfig {
   password?: string;
 }
 
-export const createPool = (config: DBConfig) => {
-  const pool = new pg.Pool(config);
+export class ConnectionPool {
+  private pool: Pool;
 
-  pool.on("connect", () => {
-    console.log("Connection Established with DB successfully");
-  });
+  constructor(config: PoolConfig) {
+    this.pool = new Pool(config);
 
-  pool.on("error", (err) => {
-    console.error("Failed to Connect with DB", err);
-  });
+    this.pool.on("connect", () => {
+      console.log("Connection Established with DB successfully");
+    });
+  
+    this.pool.on("error", (err) => {
+      console.error("Failed to Connect with DB", err);
+    });
+  }
 
-  return pool;
-};
+  async close() {
+    await this.pool.end();
+  }
+
+  async query(query: string, values?: unknown[]) {
+    return this.pool.query(query, values);
+  }
+}
+
+export const createPool = (config: PoolConfig) => {
+  return new ConnectionPool(config);
+}
