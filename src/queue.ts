@@ -195,14 +195,14 @@ export class Queue {
     this.logger.info(`Queue worker ${this.workerId} stopped.`);
   }
 
-  pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string) => {
+  pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string, ...args: any[]) => {
     let timerId: ReturnType<typeof setTimeout>;
       let isCancelled = false;
     
       const execute = async () => {
         let delay = interval;
         try {
-          const next = await task();
+          const next = await task(...args);
           if (typeof next === 'number') delay = next;
         } catch (e) {
           this.logger.error(`Error polling task type: ${taskType}`);
