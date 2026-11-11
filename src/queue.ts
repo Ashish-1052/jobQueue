@@ -196,7 +196,7 @@ export class Queue {
   }
 
   pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string, ...args: any[]) => {
-    let timerId: ReturnType<typeof setTimeout>;
+      let timerId: ReturnType<typeof setTimeout>;
       let isCancelled = false;
     
       const execute = async () => {
