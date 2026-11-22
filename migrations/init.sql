@@ -1,8 +1,19 @@
-CREATE SCHEMA jobs IF NOT EXISTS;
+CREATE SCHEMA IF NOT EXISTS jobs;
 
-Create TYPE jobs.job_status as ENUM ('PENDING', 'IN_PROGRESS', 'COMPLETED', 'DEAD') IF NOT EXISTS;
+-- Postgres has no CREATE TYPE ... IF NOT EXISTS, so check the catalog first.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE t.typname = 'job_status' AND n.nspname = 'jobs'
+    ) THEN
+        CREATE TYPE jobs.job_status AS ENUM ('PENDING', 'IN_PROGRESS', 'COMPLETED', 'DEAD');
+    END IF;
+END
+$$;
 
-CREATE TABLE jobs.jobs IF NOT EXISTS (
+CREATE TABLE IF NOT EXISTS jobs.jobs (
     "id" UUID NOT NULL PRIMARY KEY DEFAULT gen_random_uuid(),
     "function_id" TEXT NOT NULL,
     "function_params" JSONB NOT NULL DEFAULT '{}',
