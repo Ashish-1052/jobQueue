@@ -93,3 +93,6 @@ export const REAP = `
   )
   RETURNING id, status, attempts;
   `
+
+// Channel the insert trigger (migrations/notify.sql) sends NOTIFYs on.
+export const JOBS_CHANNEL = "jobs_new";

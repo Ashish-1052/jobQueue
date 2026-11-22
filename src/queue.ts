@@ -1,6 +1,6 @@
-import type { PoolConfig } from "pg";
+import { Client, type PoolConfig } from "pg";
 import { ConnectionPool, createPool } from "./db.ts";
-import { ACK, CLAIM, ENQUEUE, ENQUEUE_FALLBACK, FAIL, HEARTBEAT, REAP } from "./sql.ts";
+import { ACK, CLAIM, ENQUEUE, ENQUEUE_FALLBACK, FAIL, HEARTBEAT, JOBS_CHANNEL, REAP } from "./sql.ts";
 
 type Handler = (params: any) => Promise<void> | any;
 
@@ -17,8 +17,17 @@ interface Logger {
   error(msg: string, meta?: object): void;
 }
 
+interface Poller {
+  cancel: () => void;
+  wake: () => void;
+}
+
 export class Queue {
   private db: ConnectionPool;
+  private config: PoolConfig;
+  private listener: Client | null = null;
+  private listenRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private claimLoop: Poller | null = null;
   private workerId: string;
   private registry: Map<string, Handler>;
   private _concurrency: number;
@@ -31,6 +40,7 @@ export class Queue {
   private logger: Logger;
 
   constructor(params: QueueParams) {
+    this.config = params.config;
     this.db = createPool(params.config);
     this.workerId = crypto.randomUUID();
     this.registry = new Map(params?.registry);
@@ -95,14 +105,53 @@ export class Queue {
     // 4. heartbeat on the jobs that are currently being worked upon
     // 5. reaper that cleans (a separate timer I suppose)
     
-    this.cancelers.push(this.pollWithTimeOut(this.claim, this.pollIntervalMs, 'CLAIM'));
-    this.cancelers.push(this.pollWithTimeOut(this.reap, this.reapIntervalMs, 'REAP'));
+    this.claimLoop = this.pollWithTimeOut(this.claim, this.pollIntervalMs, 'CLAIM');
+    this.cancelers.push(this.claimLoop.cancel);
+    this.cancelers.push(this.pollWithTimeOut(this.reap, this.reapIntervalMs, 'REAP').cancel);
+    void this.listen();
+  }
+
+  // Push-based wake-up. A dedicated connection (not from the pool: LISTEN is
+  // per-session, and a pooled connection could be handed to someone else) waits
+  // for NOTIFYs sent by the insert trigger and wakes the claim loop immediately.
+  // Polling stays as the safety net: if this connection dies, or a notification
+  // is missed, the worker still finds jobs within pollIntervalMs.
+  private listen = async () => {
+    if (!this.isRunning) return;
+    const client = new Client(this.config);
+    let retired = false;
+    const retire = (reason: string) => {
+      if (retired) return;
+      retired = true;
+      if (!this.isRunning) return; // normal shutdown, not a failure
+      this.logger.warn(`LISTEN connection lost (${reason}), falling back to polling and retrying`);
+      if (this.listener === client) this.listener = null;
+      client.end().catch(() => {});
+      if (this.isRunning) this.listenRetryTimer = setTimeout(this.listen, 1000);
+    };
+
+    client.on('notification', () => this.claimLoop?.wake());
+    client.on('error', (e) => retire(e.message));
+    client.on('end', () => retire('connection ended'));
+
+    try {
+      await client.connect();
+      await client.query(`LISTEN ${JOBS_CHANNEL}`);
+      if (!this.isRunning) {
+        retired = true;
+        await client.end();
+        return;
+      }
+      this.listener = client;
+    } catch (e: any) {
+      retire(e?.message ?? String(e));
+    }
   }
 
   claim = async () => {
     try {    
       const freeSlots = this._concurrency - this.runningCount;
-      if (!freeSlots) return this.pollIntervalMs;
+      if (!freeSlots) return 10; // slots full but will free up soon; don't sleep the full poll interval
       const res = await this.db.query(CLAIM, [this.workerId, freeSlots]);
       const jobPromises: Promise<any>[] = [];
       let processed = 0;
@@ -177,29 +226,45 @@ export class Queue {
     return () => clearInterval(timer);
   }
 
-  reap = async () => {
+  // Returns nothing on purpose: pollWithTimeOut treats a returned number as the
+  // next delay, so returning the reaped count (often 0) made the reaper spin.
+  reap = async (): Promise<void> => {
     try {
       const res = await this.db.query(REAP);
-      return res.rows.length;
+      if (res.rows.length > 0) this.logger.info(`Reaped ${res.rows.length} expired jobs`);
     } catch (e: any) {
       this.logger.error(e?.message);
-      return 0;
     }
   }
-  
+
   stop = async () => {
     this.isRunning = false;
-    await this.db.close();
+    // Stop timers and the listener first, then close the pool, so nothing
+    // tries to query a pool that has already been closed.
     this.cancelers.forEach(c => c());
     this.cancelers = [];
+    this.claimLoop = null;
+    if (this.listenRetryTimer) clearTimeout(this.listenRetryTimer);
+    const listener = this.listener;
+    this.listener = null;
+    await listener?.end().catch(() => {});
+    await this.db.close();
     this.logger.info(`Queue worker ${this.workerId} stopped.`);
   }
 
-  pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string, ...args: any[]) => {
-      let timerId: ReturnType<typeof setTimeout>;
+  pollWithTimeOut = (task: (...args: any[]) => Promise<any>, interval: number, taskType: string, ...args: any[]): Poller => {
+      let timerId: ReturnType<typeof setTimeout> | undefined;
       let isCancelled = false;
-    
+      let isRunning = false;
+      let wakeRequested = false;
+
+      const schedule = (delay: number) => {
+        if (!isCancelled) timerId = setTimeout(execute, delay);
+      };
+
       const execute = async () => {
+        isRunning = true;
+        wakeRequested = false;
         let delay = interval;
         try {
           const next = await task(...args);
@@ -207,18 +272,31 @@ export class Queue {
         } catch (e) {
           this.logger.error(`Error polling task type: ${taskType}`);
         } finally {
-          if (!isCancelled) {
-            timerId = setTimeout(execute, delay);
-          }
+          isRunning = false;
+          // A wake that arrived while the task was running may refer to jobs
+          // inserted after our query looked, so run again right away.
+          schedule(wakeRequested ? 0 : delay);
         }
       };
-    
+
       execute();
-    
-      // Call this function when you want to stop polling
-      return () => {
-        isCancelled = true;
-        clearTimeout(timerId);
+
+      return {
+        // Call this when you want to stop polling
+        cancel: () => {
+          isCancelled = true;
+          clearTimeout(timerId);
+        },
+        // Run the task now instead of waiting out the current delay
+        wake: () => {
+          if (isCancelled) return;
+          if (isRunning) {
+            wakeRequested = true;
+            return;
+          }
+          clearTimeout(timerId);
+          schedule(0);
+        },
       };
   }
 }
